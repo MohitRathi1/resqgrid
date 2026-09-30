@@ -31,6 +31,12 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 });
 const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
+const STATUSES = ["ONGOING", "COMPLETED", "REJECTED"];
+const PRIORITIES = ["Low", "Medium", "High", "Critical"];
+const RESOURCE_NAMES = ["Ambulance", "RescueTeam", "FireTruck", "PoliceUnit", "Crane", "MedicalTeam"];
+// "present" = still being handled, "past" = closed
+const SCOPE_STATUSES = { present: ["ONGOING"], past: ["COMPLETED", "REJECTED"] };
+
 /* ------------------------------------------------------------------ */
 /* Gemini helper                                                       */
 /* ------------------------------------------------------------------ */
@@ -80,52 +86,153 @@ async function callGemini(parts, generationConfig = {}) {
 }
 
 /* ------------------------------------------------------------------ */
-/* 1. Resources stored in Supabase                                     */
+/* 1. Resources (Supabase table "resources") - full CRUD               */
 /* ------------------------------------------------------------------ */
+const RESOURCE_COLUMNS = "id, name, count, description, created_at, updated_at";
+const isUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+const escapeLike = (v) => v.replace(/[\\%_]/g, "\\$&");
+
+// Adds the right filter: a UUID matches by id, anything else matches the name (case-insensitive)
+const byIdOrName = (query, idOrName) =>
+  isUuid(idOrName) ? query.eq("id", idOrName) : query.ilike("name", escapeLike(idOrName));
+
+// Used by incident detection: [{ name, count }]
 async function getAvailableResources() {
   const { data, error } = await supabase.from("resources").select("name, count");
   if (error) throw new Error(`Supabase resources query failed: ${error.message}`);
-  return data; // [{ name, count }]
+  return data;
 }
 
-app.get("/api/resources", asyncHandler(async (req, res) => {
-  res.json(await getAvailableResources());
-}));
-
-// Create or update stock: PUT /api/resources/Ambulance  { "count": 5 }
-app.put("/api/resources/:name", asyncHandler(async (req, res) => {
-  const count = Number(req.body.count);
-  if (!Number.isInteger(count) || count < 0) {
-    return res.status(400).json({ error: "count must be a non-negative integer" });
+// Names the AI is allowed to request and incidents may reference (falls back to the defaults)
+async function getResourceNames() {
+  try {
+    const { data, error } = await supabase.from("resources").select("name").order("name");
+    if (error || !data.length) return RESOURCE_NAMES;
+    return data.map((r) => r.name);
+  } catch {
+    return RESOURCE_NAMES;
   }
-  const { data, error } = await supabase
-    .from("resources")
-    .upsert({ name: req.params.name, count, updated_at: new Date().toISOString() }, { onConflict: "name" })
-    .select("name, count")
-    .single();
+}
+
+// Validates a create (partial: false) or update (partial: true) body
+function parseResourceBody(body, { partial }) {
+  const values = {};
+
+  if (body.name !== undefined) {
+    if (typeof body.name !== "string" || !body.name.trim() || body.name.trim().length > 50) {
+      return { error: "name must be a non-empty string (max 50 characters)" };
+    }
+    if (/[\/\\?#%]/.test(body.name)) {
+      return { error: "name cannot contain / \\ ? # or %" };
+    }
+    values.name = body.name.trim();
+  } else if (!partial) {
+    return { error: "name is required" };
+  }
+
+  if (body.count !== undefined) {
+    const count = typeof body.count === "string" && body.count.trim() !== "" ? Number(body.count) : body.count;
+    if (!Number.isInteger(count) || count < 0) {
+      return { error: "count must be a non-negative integer" };
+    }
+    values.count = count;
+  }
+
+  if (body.description !== undefined) {
+    if (body.description !== null && typeof body.description !== "string") {
+      return { error: "description must be a string" };
+    }
+    values.description = body.description ? body.description.trim() : null;
+  }
+
+  return { values };
+}
+
+// GET /api/resources            (optional ?search=amb)
+app.get("/api/resources", asyncHandler(async (req, res) => {
+  let query = supabase.from("resources").select(RESOURCE_COLUMNS).order("name");
+  if (req.query.search) query = query.ilike("name", `%${escapeLike(String(req.query.search))}%`);
+  const { data, error } = await query;
   if (error) throw new Error(error.message);
   res.json(data);
+}));
+
+// GET /api/resources/:idOrName
+app.get("/api/resources/:idOrName", asyncHandler(async (req, res) => {
+  const { data, error } = await byIdOrName(
+    supabase.from("resources").select(RESOURCE_COLUMNS),
+    req.params.idOrName
+  ).maybeSingle();
+  if (error) throw new Error(error.message);
+  if (!data) return res.status(404).json({ error: "Resource not found" });
+  res.json(data);
+}));
+
+// POST /api/resources   { "name": "Helicopter", "count": 2, "description": "Air rescue" }
+app.post("/api/resources", asyncHandler(async (req, res) => {
+  const { values, error: bodyError } = parseResourceBody(req.body || {}, { partial: false });
+  if (bodyError) return res.status(400).json({ error: bodyError });
+
+  const { data, error } = await supabase
+    .from("resources")
+    .insert({ count: 0, ...values })
+    .select(RESOURCE_COLUMNS)
+    .single();
+  if (error) {
+    if (error.code === "23505") return res.status(409).json({ error: `Resource "${values.name}" already exists` });
+    throw new Error(error.message);
+  }
+  res.status(201).json(data);
+}));
+
+// PUT /api/resources/:idOrName   { "count": 5 }  (any of name, count, description)
+app.put("/api/resources/:idOrName", asyncHandler(async (req, res) => {
+  const { values, error: bodyError } = parseResourceBody(req.body || {}, { partial: true });
+  if (bodyError) return res.status(400).json({ error: bodyError });
+  if (Object.keys(values).length === 0) {
+    return res.status(400).json({ error: "Send at least one of: name, count, description" });
+  }
+
+  const { data, error } = await byIdOrName(
+    supabase.from("resources").update({ ...values, updated_at: new Date().toISOString() }),
+    req.params.idOrName
+  )
+    .select(RESOURCE_COLUMNS)
+    .maybeSingle();
+  if (error) {
+    if (error.code === "23505") return res.status(409).json({ error: `Resource "${values.name}" already exists` });
+    throw new Error(error.message);
+  }
+  if (!data) return res.status(404).json({ error: "Resource not found" });
+  res.json(data);
+}));
+
+// DELETE /api/resources/:idOrName
+app.delete("/api/resources/:idOrName", asyncHandler(async (req, res) => {
+  const { data, error } = await byIdOrName(supabase.from("resources").delete(), req.params.idOrName)
+    .select(RESOURCE_COLUMNS);
+  if (error) throw new Error(error.message);
+  if (!data.length) return res.status(404).json({ error: "Resource not found" });
+  res.json({ message: `Resource "${data[0].name}" deleted`, deleted: data[0] });
 }));
 
 /* ------------------------------------------------------------------ */
 /* 2. Analyse the image with Gemini (structured JSON output)           */
 /* ------------------------------------------------------------------ */
-const incidentSchema = {
+// Built per request so resources you add through the API are available to the AI immediately
+const buildIncidentSchema = (resourceNames) => ({
   type: "OBJECT",
   properties: {
     incident_detected: { type: "BOOLEAN" },
     incident_name: { type: "STRING" },
-    priority: { type: "STRING", enum: ["Low", "Medium", "High", "Critical"] },
+    priority: { type: "STRING", enum: PRIORITIES },
     people_injured: { type: "INTEGER" },
     resources_needed: {
       type: "ARRAY",
       items: {
         type: "OBJECT",
         properties: {
-          name: {
-            type: "STRING",
-            enum: ["Ambulance", "RescueTeam", "FireTruck", "PoliceUnit", "Crane", "MedicalTeam"],
-          },
+          name: { type: "STRING", enum: resourceNames },
           quantity: { type: "INTEGER" },
         },
         required: ["name", "quantity"],
@@ -133,9 +240,9 @@ const incidentSchema = {
     },
   },
   required: ["incident_detected", "incident_name", "priority", "people_injured", "resources_needed"],
-};
+});
 
-async function analyseImage(buffer, mimeType) {
+async function analyseImage(buffer, mimeType, resourceNames) {
   const prompt =
     "You are an emergency response analyst. Examine this image, identify any incident " +
     "(e.g. Accident, Fire, Flood, Building Collapse, Medical Emergency), estimate how many " +
@@ -145,7 +252,7 @@ async function analyseImage(buffer, mimeType) {
 
   const text = await callGemini(
     [{ inline_data: { mime_type: mimeType, data: buffer.toString("base64") } }, { text: prompt }],
-    { responseMimeType: "application/json", responseSchema: incidentSchema, temperature: 0.2 }
+    { responseMimeType: "application/json", responseSchema: buildIncidentSchema(resourceNames), temperature: 0.2 }
   );
 
   return JSON.parse(text);
@@ -199,6 +306,7 @@ async function saveIncident(file, incident, result, shortages) {
       priority: incident.priority,
       people_injured: incident.people_injured,
       resources_needed: result["Resources needed"],
+      resource_names: result["Resources needed"].map((r) => r.Name),
       resource_shortage: shortages.length ? shortages : null,
       alert_message: result["Alert message"] || null,
       image_path: imagePath,
@@ -210,6 +318,9 @@ async function saveIncident(file, incident, result, shortages) {
 }
 
 async function withSignedUrl(row) {
+  if (!row.image_path) {
+    return { ...row, image_url: null };
+  }
   const { data } = await supabase.storage.from(BUCKET).createSignedUrl(row.image_path, 3600); // 1 hour
   return { ...row, image_url: data?.signedUrl || null };
 }
@@ -224,7 +335,9 @@ app.post("/api/detect-incident", upload.single("image"), async (req, res) => {
       return res.status(400).json({ error: "Only JPEG, PNG, GIF or WEBP images are supported" });
     }
 
-    const incident = await analyseImage(req.file.buffer, req.file.mimetype);
+    const available = await getAvailableResources();
+    const resourceNames = available.length ? available.map((r) => r.name) : RESOURCE_NAMES;
+    const incident = await analyseImage(req.file.buffer, req.file.mimetype, resourceNames);
 
     if (!incident.incident_detected) {
       return res.json({
@@ -235,7 +348,6 @@ app.post("/api/detect-incident", upload.single("image"), async (req, res) => {
       });
     }
 
-    const available = await getAvailableResources();
     const shortages = findShortages(incident.resources_needed, available);
 
     const result = {
@@ -271,16 +383,147 @@ app.post("/api/detect-incident", upload.single("image"), async (req, res) => {
   }
 });
 
-// GET /api/incidents?limit=20
+// GET /api/incidents
+//   ?scope=present|past            present = ONGOING, past = COMPLETED + REJECTED
+//   &status=ONGOING,COMPLETED      comma-separated, any of ONGOING | COMPLETED | REJECTED
+//   &priority=High,Critical        comma-separated, any of Low | Medium | High | Critical
+//   &resource=Ambulance,Crane      incidents that need ANY of these (add &resource_match=all for ALL)
+//   &from=2026-09-01&to=2026-09-30 created date range
+//   &page=1&limit=20
+const parseList = (v) => (v ? String(v).split(",").map((x) => x.trim()).filter(Boolean) : []);
+const matchCase = (value, options) => options.find((o) => o.toLowerCase() === value.toLowerCase());
+
 app.get("/api/incidents", asyncHandler(async (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || 20, 100);
+  const page = Math.max(Number(req.query.page) || 1, 1);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+
+  // --- scope + status ---
+  const scope = String(req.query.scope || "").toLowerCase();
+  if (scope && !SCOPE_STATUSES[scope]) {
+    return res.status(400).json({ error: 'scope must be "present" or "past"' });
+  }
+  let statuses = parseList(req.query.status).map((x) => x.toUpperCase());
+  const badStatus = statuses.filter((x) => !STATUSES.includes(x));
+  if (badStatus.length) {
+    return res.status(400).json({ error: `Invalid status: ${badStatus.join(", ")}. Use ${STATUSES.join(", ")}` });
+  }
+  const hasStatusFilter = Boolean(scope || statuses.length);
+  if (scope) {
+    const allowed = SCOPE_STATUSES[scope];
+    statuses = statuses.length ? statuses.filter((x) => allowed.includes(x)) : allowed;
+  }
+
+  // --- priority ---
+  const priorities = parseList(req.query.priority).map((p) => matchCase(p, PRIORITIES));
+  if (priorities.includes(undefined)) {
+    return res.status(400).json({ error: `Invalid priority. Use ${PRIORITIES.join(", ")}` });
+  }
+
+  // --- resources ---
+  const knownNames = await getResourceNames();
+  const resources = parseList(req.query.resource).map((r) => matchCase(r, knownNames) || r);
+
+  // --- dates ---
+  const { from, to } = req.query;
+  if ((from && isNaN(Date.parse(from))) || (to && isNaN(Date.parse(to)))) {
+    return res.status(400).json({ error: "from/to must be valid dates, e.g. 2026-09-30" });
+  }
+
+  // e.g. scope=past&status=ONGOING -> nothing can match
+  if (hasStatusFilter && statuses.length === 0) {
+    return res.json({ page, limit, total: 0, data: [] });
+  }
+
+  let query = supabase.from("incidents").select("*", { count: "exact" });
+  if (hasStatusFilter) query = query.in("status", statuses);
+  if (priorities.length) query = query.in("priority", priorities);
+  if (resources.length) {
+    query = String(req.query.resource_match).toLowerCase() === "all"
+      ? query.contains("resource_names", resources)
+      : query.overlaps("resource_names", resources);
+  }
+  if (from) query = query.gte("created_at", new Date(from).toISOString());
+  if (to) {
+    const end = new Date(to);
+    if (/^\d{4}-\d{2}-\d{2}$/.test(to)) end.setUTCHours(23, 59, 59, 999); // include the whole end day
+    query = query.lte("created_at", end.toISOString());
+  }
+
+  const { data, error, count } = await query
+    .order("created_at", { ascending: false })
+    .range((page - 1) * limit, page * limit - 1);
+  if (error) throw new Error(error.message);
+
+  res.json({ page, limit, total: count, data: await Promise.all(data.map(withSignedUrl)) });
+}));
+
+// Helper: Get allocated resources for an incident
+async function getAllocatedResourcesForIncident(incidentId) {
+  const { data, error } = await supabase
+    .from("incident_resource_allocations")
+    .select("resource_id, quantity")
+    .eq("incident_id", incidentId);
+  if (error) throw new Error(error.message);
+  return data || [];
+}
+
+// Helper: Release all resources allocated to an incident
+async function releaseIncidentResources(incidentId) {
+  const allocations = await getAllocatedResourcesForIncident(incidentId);
+
+  for (const alloc of allocations) {
+    const { data: resource, error: fetchErr } = await supabase
+      .from("resources")
+      .select("count")
+      .eq("id", alloc.resource_id)
+      .maybeSingle();
+
+    if (fetchErr || !resource) continue;
+
+    // Restore the allocated quantity
+    const { error: updateErr } = await supabase
+      .from("resources")
+      .update({ count: resource.count + alloc.quantity })
+      .eq("id", alloc.resource_id);
+
+    if (updateErr) throw new Error(updateErr.message);
+  }
+
+  // Delete all allocations for this incident
+  const { error: deleteErr } = await supabase
+    .from("incident_resource_allocations")
+    .delete()
+    .eq("incident_id", incidentId);
+
+  if (deleteErr) throw new Error(deleteErr.message);
+}
+
+// PATCH /api/incidents/:id/status   { "status": "COMPLETED" }
+app.patch("/api/incidents/:id/status", asyncHandler(async (req, res) => {
+  const status = String(req.body.status || "").toUpperCase();
+  if (!STATUSES.includes(status)) {
+    return res.status(400).json({ error: `status must be one of ${STATUSES.join(", ")}` });
+  }
+
+  // If marking as COMPLETED or REJECTED, release resources
+  if ((status === "COMPLETED" || status === "REJECTED")) {
+    try {
+      await releaseIncidentResources(req.params.id);
+    } catch (err) {
+      console.error("Error releasing resources:", err);
+      return res.status(500).json({ error: `Failed to release resources: ${err.message}` });
+    }
+  }
+
   const { data, error } = await supabase
     .from("incidents")
+    .update({ status, closed_at: status === "ONGOING" ? null : new Date().toISOString() })
+    .eq("id", req.params.id)
     .select("*")
-    .order("created_at", { ascending: false })
-    .limit(limit);
+    .maybeSingle();
   if (error) throw new Error(error.message);
-  res.json(await Promise.all(data.map(withSignedUrl)));
+  if (!data) return res.status(404).json({ error: "Incident not found" });
+  res.json(await withSignedUrl(data));
 }));
 
 // GET /api/incidents/:id
@@ -288,7 +531,273 @@ app.get("/api/incidents/:id", asyncHandler(async (req, res) => {
   const { data, error } = await supabase.from("incidents").select("*").eq("id", req.params.id).maybeSingle();
   if (error) throw new Error(error.message);
   if (!data) return res.status(404).json({ error: "Incident not found" });
-  res.json(await withSignedUrl(data));
+
+  // Fetch allocated resources
+  const { data: allocations, error: allocError } = await supabase
+    .from("incident_resource_allocations")
+    .select("resource_id, quantity, created_at")
+    .eq("incident_id", req.params.id);
+
+  if (allocError) throw new Error(allocError.message);
+
+  // Fetch resource details for allocated resources
+  const resourceIds = allocations.map(a => a.resource_id);
+  let resourceDetails = [];
+  if (resourceIds.length > 0) {
+    const { data: resources, error: resourceError } = await supabase
+      .from("resources")
+      .select("id, name")
+      .in("id", resourceIds);
+    if (resourceError) throw new Error(resourceError.message);
+    resourceDetails = resources || [];
+  }
+
+  // Map allocations to include resource names
+  const allocatedResources = allocations.map(alloc => {
+    const resource = resourceDetails.find(r => r.id === alloc.resource_id);
+    return {
+      resource_id: alloc.resource_id,
+      resource_name: resource?.name || "Unknown",
+      quantity: alloc.quantity,
+      allocated_at: alloc.created_at
+    };
+  });
+
+  res.json({ ...await withSignedUrl(data), allocated_resources: allocatedResources });
+}));
+
+// POST /api/incidents - manually create an incident
+app.post("/api/incidents", asyncHandler(async (req, res) => {
+  const { incidentname, Priority, Peopple_Injuered, Resourcesneeded, Resource_Shortage, Alert_message } = req.body;
+
+  // Validate required fields
+  if (!incidentname || typeof incidentname !== "string" || !incidentname.trim()) {
+    return res.status(400).json({ error: "incidentname is required and must be a non-empty string" });
+  }
+  if (!Priority || !PRIORITIES.includes(Priority)) {
+    return res.status(400).json({ error: `Priority is required and must be one of: ${PRIORITIES.join(", ")}` });
+  }
+  if (typeof Peopple_Injuered !== "number" || Peopple_Injuered < 0) {
+    return res.status(400).json({ error: "Peopple_Injuered must be a non-negative number" });
+  }
+  if (!Array.isArray(Resourcesneeded)) {
+    return res.status(400).json({ error: "Resourcesneeded must be an array" });
+  }
+
+  // Validate Resourcesneeded array against the resources table
+  const resourceNames = await getResourceNames();
+  for (const resource of Resourcesneeded) {
+    if (!resource.Name || !resourceNames.includes(resource.Name)) {
+      return res.status(400).json({ error: `Invalid resource name: ${resource.Name}. Must be one of: ${resourceNames.join(", ")}` });
+    }
+    if (typeof resource.Quantity !== "number" || resource.Quantity < 1) {
+      return res.status(400).json({ error: `Resource ${resource.Name} Quantity must be a positive number` });
+    }
+  }
+
+  // Validate Resource_Shortage if provided
+  if (Resource_Shortage !== undefined && Resource_Shortage !== null) {
+    if (!Array.isArray(Resource_Shortage)) {
+      return res.status(400).json({ error: "Resource_Shortage must be an array" });
+    }
+    for (const shortage of Resource_Shortage) {
+      if (typeof shortage.Short !== "number" || shortage.Short < 0) {
+        return res.status(400).json({ error: `Resource shortage Short value must be a non-negative number` });
+      }
+    }
+  }
+
+  // Insert incident into database
+  const { data, error } = await supabase
+    .from("incidents")
+    .insert({
+      incident_name: incidentname.trim(),
+      priority: Priority,
+      people_injured: Peopple_Injuered,
+      resources_needed: Resourcesneeded,
+      resource_names: Resourcesneeded.map((r) => r.Name),
+      resource_shortage: Resource_Shortage && Resource_Shortage.length > 0 ? Resource_Shortage : null,
+      alert_message: Alert_message || null,
+      status: "ONGOING",
+    })
+    .select("*")
+    .single();
+
+  if (error) throw new Error(`Failed to create incident: ${error.message}`);
+  res.status(201).json(await withSignedUrl(data));
+}));
+
+/* ------------------------------------------------------------------ */
+/* Resource Allocation Endpoints                                      */
+/* ------------------------------------------------------------------ */
+
+// POST /api/incidents/:id/allocate-resources
+//   { "resources": [{ "resource_id": "abc123", "quantity": 2 }, ...] }
+app.post("/api/incidents/:id/allocate-resources", asyncHandler(async (req, res) => {
+  const incidentId = req.params.id;
+  const { resources } = req.body;
+
+  // Validate incident exists
+  const { data: incident, error: incidentError } = await supabase
+    .from("incidents")
+    .select("id, status")
+    .eq("id", incidentId)
+    .maybeSingle();
+
+  if (incidentError) throw new Error(incidentError.message);
+  if (!incident) return res.status(404).json({ error: "Incident not found" });
+
+  // Only allow allocation to ONGOING incidents
+  if (incident.status !== "ONGOING") {
+    return res.status(400).json({ error: `Cannot allocate resources to ${incident.status} incident` });
+  }
+
+  // Validate resources array
+  if (!Array.isArray(resources) || resources.length === 0) {
+    return res.status(400).json({ error: "resources must be a non-empty array" });
+  }
+
+  for (const r of resources) {
+    if (!r.resource_id || typeof r.quantity !== "number" || r.quantity < 1) {
+      return res.status(400).json({ error: "Each resource must have resource_id and positive quantity" });
+    }
+  }
+
+  // Check if resources already allocated to this incident
+  const { data: existing, error: existingError } = await supabase
+    .from("incident_resource_allocations")
+    .select("resource_id")
+    .eq("incident_id", incidentId);
+
+  if (existingError) throw new Error(existingError.message);
+  const existingIds = new Set(existing.map(e => e.resource_id));
+
+  for (const alloc of resources) {
+    if (existingIds.has(alloc.resource_id)) {
+      return res.status(409).json({ error: `Resource ${alloc.resource_id} is already allocated to this incident` });
+    }
+
+    // Check resource exists and has sufficient quantity
+    const { data: resource, error: resourceError } = await supabase
+      .from("resources")
+      .select("id, count, name")
+      .eq("id", alloc.resource_id)
+      .maybeSingle();
+
+    if (resourceError) throw new Error(resourceError.message);
+    if (!resource) {
+      return res.status(404).json({ error: `Resource ${alloc.resource_id} not found` });
+    }
+
+    if (resource.count < alloc.quantity) {
+      return res.status(400).json({
+        error: `Insufficient ${resource.name} available. Required: ${alloc.quantity}, Available: ${resource.count}`
+      });
+    }
+
+    // Reduce resource quantity
+    const { error: updateError } = await supabase
+      .from("resources")
+      .update({ count: resource.count - alloc.quantity })
+      .eq("id", alloc.resource_id);
+
+    if (updateError) throw new Error(updateError.message);
+
+    // Record the allocation
+    const { error: allocError } = await supabase
+      .from("incident_resource_allocations")
+      .insert({
+        incident_id: incidentId,
+        resource_id: alloc.resource_id,
+        quantity: alloc.quantity
+      });
+
+    if (allocError) throw new Error(allocError.message);
+  }
+
+  const allocations = await getAllocatedResourcesForIncident(incidentId);
+  res.status(201).json({
+    message: "Resources allocated successfully",
+    incident_id: incidentId,
+    allocated_resources: allocations
+  });
+}));
+
+// DELETE /api/incidents/:id/deallocate-resources/:resource_id
+app.delete("/api/incidents/:id/deallocate-resources/:resource_id", asyncHandler(async (req, res) => {
+  const { id: incidentId, resource_id: resourceId } = req.params;
+
+  // Get the allocation
+  const { data: allocation, error: allocError } = await supabase
+    .from("incident_resource_allocations")
+    .select("quantity")
+    .eq("incident_id", incidentId)
+    .eq("resource_id", resourceId)
+    .maybeSingle();
+
+  if (allocError) throw new Error(allocError.message);
+  if (!allocation) {
+    return res.status(404).json({ error: "Resource allocation not found for this incident" });
+  }
+
+  // Restore the resource quantity
+  const { data: resource, error: resourceError } = await supabase
+    .from("resources")
+    .select("count")
+    .eq("id", resourceId)
+    .maybeSingle();
+
+  if (resourceError) throw new Error(resourceError.message);
+  if (!resource) return res.status(404).json({ error: "Resource not found" });
+
+  const { error: updateError } = await supabase
+    .from("resources")
+    .update({ count: resource.count + allocation.quantity })
+    .eq("id", resourceId);
+
+  if (updateError) throw new Error(updateError.message);
+
+  // Delete the allocation
+  const { error: deleteError } = await supabase
+    .from("incident_resource_allocations")
+    .delete()
+    .eq("incident_id", incidentId)
+    .eq("resource_id", resourceId);
+
+  if (deleteError) throw new Error(deleteError.message);
+
+  res.json({ message: "Resource deallocated successfully", incident_id: incidentId, resource_id: resourceId });
+}));
+
+// GET /api/incidents/:id/allocations
+app.get("/api/incidents/:id/allocations", asyncHandler(async (req, res) => {
+  const { data: allocations, error } = await supabase
+    .from("incident_resource_allocations")
+    .select("resource_id, quantity, created_at")
+    .eq("incident_id", req.params.id);
+
+  if (error) throw new Error(error.message);
+
+  // Fetch resource names
+  const resourceIds = allocations.map(a => a.resource_id);
+  let resourceMap = {};
+  if (resourceIds.length > 0) {
+    const { data: resources, error: resourceError } = await supabase
+      .from("resources")
+      .select("id, name")
+      .in("id", resourceIds);
+    if (resourceError) throw new Error(resourceError.message);
+    resourceMap = Object.fromEntries(resources.map(r => [r.id, r.name]));
+  }
+
+  const result = allocations.map(a => ({
+    resource_id: a.resource_id,
+    resource_name: resourceMap[a.resource_id] || "Unknown",
+    quantity: a.quantity,
+    allocated_at: a.created_at
+  }));
+
+  res.json(result);
 }));
 
 /* ------------------------------------------------------------------ */
@@ -341,5 +850,3 @@ app.listen(PORT, async () => {
     console.log(`❌ Supabase NOT connected: ${err.message}`);
   }
 });
-
-
