@@ -1,1 +1,1 @@
-# resqgrid
+# resQGrid
